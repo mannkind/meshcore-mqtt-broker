@@ -13,6 +13,7 @@ export class RateLimiter {
   private readonly windowMs: number;
   private readonly maxFailedConnections: number;
   private readonly blockDurationMs: number;
+  private sweepTimer: ReturnType<typeof setInterval>;
 
   constructor(
     windowMs: number = 60000,        // 1 minute
@@ -22,6 +23,22 @@ export class RateLimiter {
     this.windowMs = windowMs;
     this.maxFailedConnections = maxFailedConnections;
     this.blockDurationMs = blockDurationMs;
+    this.sweepTimer = setInterval(() => this.sweep(), this.windowMs);
+  }
+
+  private sweep(): void {
+    const now = Date.now();
+    for (const [ip, record] of this.failedConnectionsByIP) {
+      const blockExpired = !record.blockedUntil || now >= record.blockedUntil;
+      const windowExpired = now - record.firstFailure > this.windowMs;
+      if (blockExpired && windowExpired) {
+        this.failedConnectionsByIP.delete(ip);
+      }
+    }
+  }
+
+  destroy(): void {
+    clearInterval(this.sweepTimer);
   }
 
   /**

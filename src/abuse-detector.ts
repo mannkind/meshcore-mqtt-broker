@@ -1,5 +1,7 @@
 import { createHash } from 'crypto';
 import Database from 'better-sqlite3';
+import type { PublishPacket } from 'aedes';
+import type { ExtendedClient } from './types';
 
 // ============================================================================
 // Type Definitions
@@ -485,7 +487,7 @@ export class AbuseDetector {
   // Packet Processing
   // ============================================================================
 
-  public recordPacket(client: any, packet: any): boolean {
+  public recordPacket(client: Pick<Required<ExtendedClient>, 'publicKey'>, packet: Pick<PublishPacket, 'payload'>): boolean {
     const publicKey = client.publicKey;
     const state = this.clients.get(publicKey);
     
@@ -570,7 +572,7 @@ export class AbuseDetector {
     return true;
   }
 
-  public shouldSilencePacket(client: any): boolean {
+  public shouldSilencePacket(client: Pick<Required<ExtendedClient>, 'publicKey'>): boolean {
     const publicKey = client.publicKey;
     const state = this.clients.get(publicKey);
     
@@ -743,7 +745,7 @@ export class AbuseDetector {
     return true;
   }
 
-  public checkAnomalies(state: ClientTrustState, packet: any): boolean {
+  public checkAnomalies(state: ClientTrustState, packet: Pick<PublishPacket, 'payload'>): boolean {
     // Additional anomaly checks can be added here
     return true;
   }

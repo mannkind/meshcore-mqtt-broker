@@ -2,12 +2,15 @@ import Aedes from 'aedes';
 import { createServer } from 'http';
 import { WebSocketServer } from 'ws';
 import { Duplex } from 'stream';
+import { createHmac } from 'crypto';
 import { verifyAuthToken } from '@michaelhart/meshcore-decoder';
 import { getAirportInfo } from 'airport-utils';
 import { RateLimiter } from './rate-limiter';
 import { getClientIP } from './ip-utils';
 import { AbuseDetector } from './abuse-detector';
 import { loadMqttConfig, loadAbuseConfig, loadSubscriberConfig } from './config';
+import { ClientType, SubscriberRole } from './types';
+import type { ExtendedClient, ExtendedStream, TrustMetricsSnapshot } from './types';
 
 // Load and validate configuration
 const mqttConfig = loadMqttConfig();
@@ -18,6 +21,12 @@ const WS_PORT = mqttConfig.wsPort;
 const HOST = mqttConfig.host;
 const EXPECTED_AUDIENCE = mqttConfig.expectedAudience;
 
+function hashSubscriberPassword(password: string): string {
+  return createHmac('sha256', mqttConfig.subscriberHmacSecret)
+    .update(password)
+    .digest('hex');
+}
+
 // Helper function to validate IATA airport codes
 function isValidIATACode(code: string): boolean {
   try {
@@ -26,19 +35,6 @@ function isValidIATACode(code: string): boolean {
   } catch {
     return false;
   }
-}
-
-// Client types
-enum ClientType {
-  SUBSCRIBER = 'subscriber',
-  PUBLISHER = 'publisher'
-}
-
-// Subscriber roles
-enum SubscriberRole {
-  ADMIN = 1,           // Full access + can delete retained messages
-  FULL_ACCESS = 2,     // Full access, no hidden data
-  LIMITED = 3          // All access but with hidden/sensitive data filtered
 }
 
 // Load subscriber users from environment variables
@@ -66,7 +62,7 @@ while (true) {
   const maxConnStr = parts[3];
   
   if (username && password) {
-    subscriberUsers.set(username, password);
+    subscriberUsers.set(username, hashSubscriberPassword(password));
     
     // Parse and store role (default to LIMITED if not specified or invalid)
     let role = SubscriberRole.LIMITED;
@@ -96,7 +92,7 @@ while (true) {
       [SubscriberRole.FULL_ACCESS]: 'full_access', 
       [SubscriberRole.LIMITED]: 'limited'
     };
-    console.log(`[CONFIG] Loaded subscriber user: ${username} (role: ${roleNames[role]}, maxConnections: ${maxConn})`);
+    console.log(`[CONFIG] Loaded subscriber user (role: ${roleNames[role]}, maxConnections: ${maxConn})`);
   } else {
     console.warn(`[CONFIG] Invalid format for SUBSCRIBER_${subscriberIndex}: ${subscriberEnvVar}`);
   }
@@ -120,13 +116,12 @@ const rateLimiter = new RateLimiter(60000, 10, 300000);
 const abuseDetector = new AbuseDetector(abuseConfig);
 
 // Helper to get client identifier for logging
-function getClientLogPrefix(client: any): string {
+function getClientLogPrefix(client: ExtendedClient | null): string {
   if (!client) return '[UNKNOWN]';
-  
-  const clientType = client.clientType;
-  if (clientType === ClientType.PUBLISHER && client.publicKey) {
+
+  if (client.clientType === ClientType.PUBLISHER && client.publicKey) {
     return `[O:${client.publicKey.substring(0, 8)}]`;
-  } else if (clientType === ClientType.SUBSCRIBER && client.username) {
+  } else if (client.clientType === ClientType.SUBSCRIBER && client.username) {
     return `[S:${client.username}]`;
   }
   return `[C:${client.id}]`;
@@ -134,7 +129,8 @@ function getClientLogPrefix(client: any): string {
 
 // Authentication handler
 aedes.authenticate = async (client, username, password, callback) => {
-  const logPrefix = `[C:${client.id}]`;
+  const ext = client as ExtendedClient;
+  const logPrefix = `[C:${ext.id}]`;
   console.log(`${logPrefix} [AUTH] Authentication attempt - Username: ${username}`);
 
   try {
@@ -144,33 +140,32 @@ aedes.authenticate = async (client, username, password, callback) => {
     // Check if this is a subscriber login
     if (subscriberUsers.has(usernameStr)) {
       const expectedPassword = subscriberUsers.get(usernameStr);
-      if (passwordStr === expectedPassword) {
+      if (hashSubscriberPassword(passwordStr) === expectedPassword) {
         // Check connection limit before allowing
         const maxConn = subscriberMaxConnections.get(usernameStr) || subscriberConfig.defaultMaxConnections;
         const activeConns = subscriberActiveConnections.get(usernameStr) || new Set();
-        
+
         if (activeConns.size >= maxConn) {
           console.log(`${logPrefix} [AUTH] ✗ Subscriber connection limit exceeded (${usernameStr}, ${activeConns.size}/${maxConn})`);
           callback(null, false);
           return;
         }
-        
+
         // Track this connection
-        activeConns.add(client.id);
+        activeConns.add(ext.id);
         subscriberActiveConnections.set(usernameStr, activeConns);
-        
+
         const role = subscriberRoles.get(usernameStr) || SubscriberRole.LIMITED;
         console.log(`${logPrefix} [AUTH] ✓ Subscriber authenticated (${usernameStr}, role: ${role}, connections: ${activeConns.size}/${maxConn})`);
-        (client as any).clientType = ClientType.SUBSCRIBER;
-        (client as any).username = usernameStr;
-        (client as any).role = role;
-        
+        ext.clientType = ClientType.SUBSCRIBER;
+        ext.username = usernameStr;
+        ext.role = role;
+
         // Mark stream as authenticated
-        const stream = (client as any).conn;
-        if (stream && stream.clientIP) {
-          stream.authenticated = true;
+        if (ext.conn?.clientIP) {
+          ext.conn.authenticated = true;
         }
-        
+
         callback(null, true);
       } else {
         console.log(`${logPrefix} [AUTH] ✗ Subscriber authentication failed - Invalid password`);
@@ -188,11 +183,10 @@ aedes.authenticate = async (client, username, password, callback) => {
     }
 
     const publicKey = usernameStr.substring(3).toUpperCase().trim();
-    
+
     // Validate public key format (should be 64 hex characters)
     if (!/^[0-9A-F]{64}$/i.test(publicKey)) {
-      console.log(`${logPrefix} [AUTH] ✗ Invalid public key format: ${publicKey}`);
-      console.log(`${logPrefix} [AUTH] Public key length: ${publicKey.length}, hex dump: ${Buffer.from(publicKey).toString('hex')}`);
+      console.log(`${logPrefix} [AUTH] ✗ Invalid public key format (length: ${publicKey.length})`);
       callback(null, false);
       return;
     }
@@ -205,42 +199,35 @@ aedes.authenticate = async (client, username, password, callback) => {
 
     // Verify the auth token using meshcore-decoder
     const tokenPayload = await verifyAuthToken(passwordStr, publicKey);
-    console.debug(`${logPrefix} [AUTH] Token input: "${passwordStr}"`);
 
-    
     if (!tokenPayload) {
       console.log(`${logPrefix} [AUTH] ✗ Invalid token signature`);
-      console.debug(`${logPrefix} [AUTH] Token input: "${passwordStr}"`);      
-      console.debug(`${logPrefix} [AUTH] Public key: ${publicKey}`);
-      console.debug(`${logPrefix} [AUTH] Token hex: ${Buffer.from(passwordStr).toString('hex')}`);
       callback(null, false);
       return;
     }
-    
+
     // Validate audience claim if configured
     if (EXPECTED_AUDIENCE && tokenPayload.aud !== EXPECTED_AUDIENCE) {
       console.log(`${logPrefix} [AUTH] ✗ Invalid audience: ${tokenPayload.aud} (expected: ${EXPECTED_AUDIENCE})`);
       callback(null, false);
       return;
     }
-    
+
     const shortKey = publicKey.substring(0, 8);
     console.log(`[O:${shortKey}] [AUTH] ✓ Publisher authenticated${tokenPayload.aud ? ` [aud: ${tokenPayload.aud}]` : ''}`);
-    // Store the public key and client type with the client for later use
-    (client as any).publicKey = publicKey;
-    (client as any).tokenPayload = tokenPayload;
-    (client as any).clientType = ClientType.PUBLISHER;
-    
+    ext.publicKey = publicKey;
+    ext.tokenPayload = tokenPayload;
+    ext.clientType = ClientType.PUBLISHER;
+
     // Mark stream as authenticated
-    const stream = (client as any).conn;
-    if (stream && stream.clientIP) {
-      stream.authenticated = true;
+    if (ext.conn?.clientIP) {
+      ext.conn.authenticated = true;
     }
-    
+
     // Initialize abuse detection tracking
-    const clientIP = stream?.clientIP;
+    const clientIP = ext.conn?.clientIP;
     abuseDetector.initializeClient(publicKey, `v1_${publicKey}`, clientIP);
-    
+
     callback(null, true);
   } catch (error) {
     console.error(`${logPrefix} [AUTH] Error during authentication:`, error);
@@ -254,20 +241,20 @@ aedes.authorizePublish = (client, packet, callback) => {
     callback(new Error('No client'));
     return;
   }
-  
-  const logPrefix = getClientLogPrefix(client);
-  const clientType = (client as any).clientType;
-  
+
+  const ext = client as ExtendedClient;
+  const logPrefix = getClientLogPrefix(ext);
+
   // Important: Strip retain flag from /status messages to prevent stale data on ingestor restart
   // LWT (offline) messages are also STATUS messages and should NOT be retained
   if (packet.topic.endsWith('/status') && packet.retain) {
     console.log(`${logPrefix} [AUTHZ] Stripping retain flag from STATUS message -> ${packet.topic}`);
     packet.retain = false;
   }
-  
+
   // Subscriber clients cannot publish (subscribe-only)
-  if (clientType === ClientType.SUBSCRIBER) {
-    const role = (client as any).role || SubscriberRole.LIMITED;
+  if (ext.clientType === ClientType.SUBSCRIBER) {
+    const role = ext.role ?? SubscriberRole.LIMITED;
     
     // Admin subscribers (role 1) can publish empty retained messages to delete them
     if (role === SubscriberRole.ADMIN && packet.retain && packet.payload.length === 0) {
@@ -304,7 +291,7 @@ aedes.authorizePublish = (client, packet, callback) => {
   }
   
   // Publisher clients can only publish to meshcore/* topics
-  if (clientType === ClientType.PUBLISHER) {
+  if (ext.clientType === ClientType.PUBLISHER) {
     if (!packet.topic.startsWith('meshcore/')) {
       console.log(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (not meshcore/*)`);
       callback(new Error('Publishers can only publish to meshcore/* topics'));
@@ -384,7 +371,7 @@ aedes.authorizePublish = (client, packet, callback) => {
     }
     
     // Validate topic public key matches authenticated client
-    const clientPublicKey = (client as any).publicKey.toUpperCase();
+    const clientPublicKey = (ext.publicKey ?? '').toUpperCase();
     if (topicPublicKey !== clientPublicKey) {
       console.log(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (pubkey mismatch)`);
       console.log(`${logPrefix} [DISCONNECT] Closing client - Public key mismatch`);
@@ -435,14 +422,21 @@ aedes.authorizePublish = (client, packet, callback) => {
     // Validate that the message contains origin_id matching the authenticated public key
     try {
       const payload = packet.payload.toString('utf-8');
-      const message = JSON.parse(payload);
-      
-      if (!message.origin_id) {
-        console.log(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (missing origin_id)`);
-        callback(new Error('Message must contain origin_id field'));
+
+      if (Buffer.byteLength(payload, 'utf-8') > 65536) {
+        console.log(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (payload too large)`);
+        callback(new Error('Payload exceeds maximum allowed size'));
         return;
       }
-      
+
+      const message = JSON.parse(payload);
+
+      if (!message.origin_id || typeof message.origin_id !== 'string') {
+        console.log(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (missing or non-string origin_id)`);
+        callback(new Error('Message must contain origin_id as a string'));
+        return;
+      }
+
       // Normalize both to uppercase for comparison
       const messageOriginId = message.origin_id.toUpperCase();
       const normalizedClientKey = clientPublicKey.toUpperCase();
@@ -457,26 +451,26 @@ aedes.authorizePublish = (client, packet, callback) => {
       // Use normalizedLocation to ensure consistent tracking regardless of case
       
       // Check IATA changes
-      const publicKey = (client as any).publicKey;
-      const trustState = abuseDetector.getClientStats(publicKey);
+      const publicKey = ext.publicKey;
+      const trustState = abuseDetector.getClientStats(publicKey ?? '');
       if (trustState) {
         abuseDetector.checkIataChange(trustState, normalizedLocation);
-        
+
         // Record packet
-        abuseDetector.recordPacket(client, packet);
+        abuseDetector.recordPacket({ publicKey: publicKey! }, packet);
       }
-      
+
       console.log(`${logPrefix} [AUTHZ] ✓ Publish authorized -> ${packet.topic}`);
-      
+
       // Publish JWT payload to /internal topic (ADMIN-only, contains PII)
-      const tokenPayload = (client as any).tokenPayload;
+      const tokenPayload = ext.tokenPayload;
       if (tokenPayload) {
         // Use normalizedLocation to ensure consistent internal topic naming
         const internalTopic = `meshcore/${normalizedLocation}/${clientPublicKey}/internal`;
-        
+
         // Get trust state for internal message
         const trustState = abuseDetector.getClientStats(clientPublicKey);
-        let trustMetrics: any = null;
+        let trustMetrics: TrustMetricsSnapshot | null = null;
         
         if (trustState) {
           const clockQuality = trustState.clockTracking.erraticJumps.length === 0 ? 'stable' :
@@ -561,19 +555,19 @@ aedes.authorizeSubscribe = (client, subscription, callback) => {
     callback(new Error('No client'));
     return;
   }
-  
-  const logPrefix = getClientLogPrefix(client);
-  const clientType = (client as any).clientType;
-  
+
+  const ext = client as ExtendedClient;
+  const logPrefix = getClientLogPrefix(ext);
+
   // Publisher clients cannot subscribe (publish-only) - EXCEPT their own serial/commands topic
-  if (clientType === ClientType.PUBLISHER) {
+  if (ext.clientType === ClientType.PUBLISHER) {
     // Allow publishers to subscribe to their own serial/commands topic for remote serial access
     // Topic format: meshcore/{IATA}/{PUBLIC_KEY}/serial/commands
     if (subscription.topic.endsWith('/serial/commands')) {
       const parts = subscription.topic.split('/');
       if (parts.length === 5 && parts[0] === 'meshcore' && parts[3] === 'serial') {
         const topicPublicKey = parts[2].toUpperCase();
-        const clientPublicKey = ((client as any).publicKey || '').toUpperCase();
+        const clientPublicKey = (ext.publicKey ?? '').toUpperCase();
         // Publisher can only subscribe to their OWN serial/commands topic
         if (topicPublicKey === clientPublicKey && clientPublicKey.length === 64) {
           console.log(`${logPrefix} [AUTHZ] ✓ Subscribe authorized (own serial/commands) -> ${subscription.topic}`);
@@ -585,17 +579,17 @@ aedes.authorizeSubscribe = (client, subscription, callback) => {
     console.log(`${logPrefix} [AUTHZ] ✗ Subscribe denied (publisher) -> ${subscription.topic}`);
     console.log(`${logPrefix} [DISCONNECT] Closing client - Publishers cannot subscribe`);
     callback(new Error('Publisher clients are publish-only'));
-    client.close();
+    ext.close();
     return;
   }
-  
+
   // Subscriber clients can subscribe to any topic (they're listeners)
-  if (clientType === ClientType.SUBSCRIBER) {
+  if (ext.clientType === ClientType.SUBSCRIBER) {
     console.log(`${logPrefix} [AUTHZ] ✓ Subscribe authorized -> ${subscription.topic}`);
     callback(null, subscription);
     return;
   }
-  
+
   // Unknown client type
   console.log(`${logPrefix} [AUTHZ] ✗ Subscribe denied -> ${subscription.topic} (unknown client type)`);
   callback(new Error('Unknown client type'));
@@ -609,26 +603,25 @@ aedes.authorizeForward = (client, packet) => {
   if (!client) {
     return packet;
   }
-  
-  const clientType = (client as any).clientType;
-  const role = (client as any).role;
-  
+
+  const ext = client as ExtendedClient;
+
   // Block $SYS/* messages for non-admin subscribers (only role 1 can see system topics)
-  if (clientType === ClientType.SUBSCRIBER && role !== SubscriberRole.ADMIN) {
+  if (ext.clientType === ClientType.SUBSCRIBER && ext.role !== SubscriberRole.ADMIN) {
     if (packet.topic.startsWith('$SYS/')) {
       return null; // Block delivery of this message
     }
   }
   
   // Critical: Block /internal topics for non-admin subscribers (contains PII)
-  if (clientType === ClientType.SUBSCRIBER && role !== SubscriberRole.ADMIN) {
+  if (ext.clientType === ClientType.SUBSCRIBER && ext.role !== SubscriberRole.ADMIN) {
     if (packet.topic.includes('/internal')) {
       return null; // Block delivery of this message
     }
   }
   
   // Block /serial/* topics for non-admin subscribers (remote serial access is admin-only)
-  if (clientType === ClientType.SUBSCRIBER && role !== SubscriberRole.ADMIN) {
+  if (ext.clientType === ClientType.SUBSCRIBER && ext.role !== SubscriberRole.ADMIN) {
     if (packet.topic.includes('/serial/')) {
       return null; // Block delivery of this message
     }
@@ -660,7 +653,7 @@ aedes.authorizeForward = (client, packet) => {
   }
   
   // Only filter for LIMITED role subscribers (role 3)
-  if (clientType === ClientType.SUBSCRIBER && role === SubscriberRole.LIMITED) {
+  if (ext.clientType === ClientType.SUBSCRIBER && ext.role === SubscriberRole.LIMITED) {
     // Filter status messages (meshcore/*/status) to remove stats, model, and firmware_version
     if (packet.topic.endsWith('/status') && packet.payload && packet.payload.length > 0) {
       try {
@@ -740,62 +733,56 @@ aedes.authorizeForward = (client, packet) => {
 
 // Event handlers
 aedes.on('client', (client) => {
-  // Link stream to client if available
-  (client as any).stream = (client as any).conn;
-  
-  const logPrefix = getClientLogPrefix(client);
+  const ext = client as ExtendedClient;
+  ext.stream = ext.conn;
+
+  const logPrefix = getClientLogPrefix(ext);
   console.log(`${logPrefix} [CLIENT] Connected`);
-  console.log(`${logPrefix} [CLIENT] Connection details - conn exists: ${!!(client as any).conn}, clientIP: ${(client as any).conn?.clientIP}`);
-  
-  // Track when this client connected for disconnect timing
-  (client as any).connectedAt = Date.now();
-  
+  console.log(`${logPrefix} [CLIENT] Connection details - conn exists: ${!!ext.conn}, clientIP: ${ext.conn?.clientIP}`);
+
+  ext.connectedAt = Date.now();
+
   // Hook into the client's stream close event to see WHO closed it
-  const stream = (client as any).stream;
+  const stream = ext.stream;
   if (stream) {
     const originalClose = stream.close?.bind(stream);
     const originalDestroy = stream.destroy?.bind(stream);
-    
-    (stream as any).close = function(...args: any[]) {
+
+    stream.close = function(...args: unknown[]) {
       console.log(`${logPrefix} [STREAM] close() called (server-initiated close)`);
       if (originalClose) originalClose(...args);
     };
     
-    (stream as any).destroy = function(...args: any[]) {
-      console.log(`${logPrefix} [STREAM] destroy() called - error: ${args[0]?.message || 'none'}`);
-      if (originalDestroy) originalDestroy(...args);
+    stream.destroy = function(error?: Error | undefined) {
+      console.log(`${logPrefix} [STREAM] destroy() called - error: ${error?.message || 'none'}`);
+      if (originalDestroy) originalDestroy(error);
+      return this;
     };
   }
 });
 
 aedes.on('clientDisconnect', (client) => {
-  const logPrefix = getClientLogPrefix(client);
-  const connectedAt = (client as any).connectedAt;
-  const duration = connectedAt ? Math.round((Date.now() - connectedAt) / 1000) : 'unknown';
-  
+  const ext = client as ExtendedClient;
+  const logPrefix = getClientLogPrefix(ext);
+  const duration = ext.connectedAt ? Math.round((Date.now() - ext.connectedAt) / 1000) : 'unknown';
+
   console.log(`${logPrefix} [CLIENT] Disconnected (connected for ${duration}s)`);
-  
-  // Log additional info to debug why this client disconnected
-  if (client) {
-    console.log(`${logPrefix} [CLIENT] Disconnect details - clientType: ${(client as any).clientType}, publicKey: ${(client as any).publicKey?.substring(0, 8)}`);
-    
-    // Clean up subscriber connection tracking
-    const clientType = (client as any).clientType;
-    const username = (client as any).username;
-    if (clientType === ClientType.SUBSCRIBER && username) {
-      const activeConns = subscriberActiveConnections.get(username);
-      if (activeConns) {
-        activeConns.delete(client.id);
-        const maxConn = subscriberMaxConnections.get(username) || subscriberConfig.defaultMaxConnections;
-        console.log(`${logPrefix} [CLIENT] Subscriber connection removed (${username}, connections: ${activeConns.size}/${maxConn})`);
-      }
+  console.log(`${logPrefix} [CLIENT] Disconnect details - clientType: ${ext.clientType}, publicKey: ${ext.publicKey?.substring(0, 8)}`);
+
+  // Clean up subscriber connection tracking
+  if (ext.clientType === ClientType.SUBSCRIBER && ext.username) {
+    const activeConns = subscriberActiveConnections.get(ext.username);
+    if (activeConns) {
+      activeConns.delete(ext.id);
+      const maxConn = subscriberMaxConnections.get(ext.username) || subscriberConfig.defaultMaxConnections;
+      console.log(`${logPrefix} [CLIENT] Subscriber connection removed (${ext.username}, connections: ${activeConns.size}/${maxConn})`);
     }
   }
 });
 
 aedes.on('publish', (packet, client) => {
   if (client) {
-    const logPrefix = getClientLogPrefix(client);
+    const logPrefix = getClientLogPrefix(client as ExtendedClient);
     console.log(`${logPrefix} [PUBLISH] ${packet.topic} (${packet.payload.length} bytes)`);
   } else {
     console.log(`[PUBLISH] Internal -> ${packet.topic} (${packet.payload.length} bytes)`);
@@ -803,22 +790,24 @@ aedes.on('publish', (packet, client) => {
 });
 
 aedes.on('subscribe', (subscriptions, client) => {
-  const logPrefix = getClientLogPrefix(client);
+  const logPrefix = getClientLogPrefix(client as ExtendedClient);
   console.log(`${logPrefix} [SUBSCRIBE] Attempting to subscribe to: ${subscriptions.map(s => s.topic).join(', ')}`);
 });
 
 // Log when client sends DISCONNECT packet (graceful disconnect)
 aedes.on('clientError', (client, err) => {
-  const logPrefix = getClientLogPrefix(client);
+  const logPrefix = getClientLogPrefix(client as ExtendedClient);
   console.log(`${logPrefix} [ERROR] Client error: ${err.message}`);
 });
+
+const HTTP_REDIRECT_URL = process.env.HTTP_REDIRECT_URL || 'https://analyzer.letsmesh.net/';
 
 // Create HTTP server for WebSocket
 const httpServer = createServer((req, res) => {
   // If this is not a WebSocket upgrade request, redirect to analyzer
   if (!req.headers.upgrade || req.headers.upgrade.toLowerCase() !== 'websocket') {
-    console.log(`[HTTP] Non-WebSocket request from ${getClientIP(req)}, redirecting to analyzer`);
-    res.writeHead(301, { 'Location': 'https://analyzer.letsmesh.net/' });
+    console.log(`[HTTP] Non-WebSocket request from ${getClientIP(req)}, redirecting`);
+    res.writeHead(301, { 'Location': HTTP_REDIRECT_URL });
     res.end();
     return;
   }
@@ -857,31 +846,29 @@ wsServer.on('connection', (ws, req) => {
     console.error(`[WEBSOCKET] Error from ${clientIP}:`, error.message);
   });
   
-  // Create a duplex stream from the WebSocket
+  // Create a typed duplex stream from the WebSocket
   const stream = new Duplex({
     read() {
       // No-op, data is pushed via ws.on('message')
     },
-    write(chunk, encoding, callback) {
+    write(chunk, _encoding, callback) {
       if (ws.readyState === ws.OPEN) {
         // Log MQTT PINGRESP packets (0xD0 = PINGRESP)
         if (chunk instanceof Buffer && chunk.length >= 2 && chunk[0] === 0xD0) {
-          const clientInfo = (stream as any).client;
+          const clientInfo = extStream.client;
           if (clientInfo) {
-            const logPrefix = getClientLogPrefix(clientInfo);
-            console.log(`${logPrefix} [MQTT] Sending PINGRESP (PONG) to client`);
+            console.log(`${getClientLogPrefix(clientInfo)} [MQTT] Sending PINGRESP (PONG) to client`);
           } else {
             console.log(`[MQTT] Sending PINGRESP (PONG) to unauthenticated client`);
           }
         }
-        
+
         ws.send(chunk, (error) => {
           // Suppress EPIPE errors - they're expected when client disconnects
-          if (error && (error as any).code !== 'EPIPE') {
-            const clientInfo = (stream as any).client;
+          if (error && (error as NodeJS.ErrnoException).code !== 'EPIPE') {
+            const clientInfo = extStream.client;
             if (clientInfo) {
-              const logPrefix = getClientLogPrefix(clientInfo);
-              console.error(`${logPrefix} [WEBSOCKET] Send error:`, error);
+              console.error(`${getClientLogPrefix(clientInfo)} [WEBSOCKET] Send error:`, error);
             } else {
               console.error('[WEBSOCKET] Send error:', error);
             }
@@ -892,16 +879,19 @@ wsServer.on('connection', (ws, req) => {
         callback(new Error('WebSocket not open'));
       }
     }
-  });
+  }) as ExtendedStream;
+
+  const extStream = stream;
+  extStream.clientIP = clientIP;
+  extStream.authenticated = false;
 
   // Forward WebSocket messages to the stream
   ws.on('message', (data) => {
     // Log MQTT PINGREQ packets (0xC0 = PINGREQ) with client identifier
     if (data instanceof Buffer && data.length >= 2 && data[0] === 0xC0) {
-      const clientInfo = (stream as any).client;
+      const clientInfo = extStream.client;
       if (clientInfo) {
-        const logPrefix = getClientLogPrefix(clientInfo);
-        console.log(`${logPrefix} [MQTT] Received PINGREQ (PING) from client`);
+        console.log(`${getClientLogPrefix(clientInfo)} [MQTT] Received PINGREQ (PING) from client`);
       } else {
         console.log('[MQTT] Received PINGREQ (PING) from unauthenticated client');
       }
@@ -909,25 +899,18 @@ wsServer.on('connection', (ws, req) => {
     stream.push(data);
   });
 
-  // Store client IP on stream for logging
-  (stream as any).clientIP = clientIP;
-  (stream as any).authenticated = false;
-  
   // Handle WebSocket close
   ws.on('close', (code, reason) => {
-    const clientInfo = (stream as any).client;
-    const wasAuthenticated = (stream as any).authenticated;
-    
+    const clientInfo = extStream.client;
+    const wasAuthenticated = extStream.authenticated;
+
     // Check if client properly authenticated (has clientType set)
-    const hasValidAuth = clientInfo && (clientInfo as any).clientType;
-    
-    if (hasValidAuth) {
-      const logPrefix = getClientLogPrefix(clientInfo);
-      console.log(`${logPrefix} [WEBSOCKET] Connection closed from ${clientIP} - Code: ${code}, Reason: ${reason.toString() || 'none'}`);
+    if (clientInfo?.clientType) {
+      console.log(`${getClientLogPrefix(clientInfo)} [WEBSOCKET] Connection closed from ${clientIP} - Code: ${code}, Reason: ${reason.toString() || 'none'}`);
     } else {
       // Unauthenticated or invalid client - count as failed connection
       console.log(`[C:${clientInfo?.id || 'null'}] [WEBSOCKET] Connection closed (unauthenticated) from ${clientIP} - Code: ${code}, Reason: ${reason.toString() || 'none'}`);
-      
+
       if (!wasAuthenticated) {
         const blocked = rateLimiter.recordFailure(clientIP);
         if (blocked) {
@@ -940,10 +923,9 @@ wsServer.on('connection', (ws, req) => {
 
   // Handle stream end
   stream.on('end', () => {
-    const clientInfo = (stream as any).client;
+    const clientInfo = extStream.client;
     if (clientInfo) {
-      const logPrefix = getClientLogPrefix(clientInfo);
-      console.log(`${logPrefix} [STREAM] Stream ended, closing WebSocket`);
+      console.log(`${getClientLogPrefix(clientInfo)} [STREAM] Stream ended, closing WebSocket`);
     } else {
       console.log('[STREAM] Stream ended (unauthenticated), closing WebSocket');
     }
@@ -988,6 +970,7 @@ httpServer.listen(WS_PORT, HOST, () => {
 process.on('SIGINT', () => {
   console.log('\n[SHUTDOWN] Closing MQTT broker...');
   abuseDetector.shutdown();
+  rateLimiter.destroy();
   aedes.close(() => {
     console.log('[SHUTDOWN] Broker closed');
     process.exit(0);
@@ -997,6 +980,7 @@ process.on('SIGINT', () => {
 process.on('SIGTERM', () => {
   console.log('\n[SHUTDOWN] Closing MQTT broker...');
   abuseDetector.shutdown();
+  rateLimiter.destroy();
   aedes.close(() => {
     console.log('[SHUTDOWN] Broker closed');
     process.exit(0);
